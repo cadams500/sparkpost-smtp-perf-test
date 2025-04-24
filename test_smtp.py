@@ -26,7 +26,7 @@ def main():
     sender = SparkPostSMTPSender(
         api_key=api_key,
         from_email=from_email,
-        max_connections=16,
+        max_connections=60,
         messages_per_connection=100
     )
     
@@ -41,7 +41,7 @@ def main():
                 "X-Campaign-ID": "sparkpost-performance-test-campaign"  # Using performance test prefix
             }
         }
-        for i in range(1, 201)  # Generate 10 test emails
+        for i in range(1, 101)  # Generate 10 test emails
     ]
     
     # Send the emails
@@ -49,11 +49,12 @@ def main():
     results = sender.send_emails(test_emails, batch_size=5)
     
     # Print results
-    logger.info(f"Test complete!")
+    logger.info("Test complete!")
     logger.info(f"Total emails: {results['total_emails']}")
     logger.info(f"Successfully sent: {results['successfully_sent']}")
     logger.info(f"Failed: {results['failed']}")
     logger.info(f"Rate: {results['emails_per_second']:.2f} emails/second")
+    logger.info(f"Rate: {results['emails_per_second'] * 3600:,.0f} emails/hour")
     logger.info(f"Latency (ms): min={results['min_latency_ms']:.2f}, avg={results['avg_latency_ms']:.2f}, max={results['max_latency_ms']:.2f}")
     logger.info(f"Implied latency (ms): {results['implied_latency_ms']:.2f} (total time / messages)")
     
