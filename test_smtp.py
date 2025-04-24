@@ -26,27 +26,26 @@ def main():
     sender = SparkPostSMTPSender(
         api_key=api_key,
         from_email=from_email,
-        max_connections=10,
+        max_connections=16,
         messages_per_connection=100
     )
     
     # Create a test batch of emails
     test_emails = [
         {
-            "to_email": f"recipient{i}@example.com",
+            "to_email": f"recipient{i}@example.com.sink.sparkpostmail.com",  # Using sink server format
             "subject": f"Test Email {i}",
             "text_content": f"This is test email {i} plain text content",
             "html_content": f"<html><body><h1>Test Email {i}</h1><p>This is the HTML content.</p></body></html>",
             "custom_headers": {
-                "X-Campaign-ID": "test-campaign",
-                "X-Template-ID": f"template-{i % 5}"
+                "X-Campaign-ID": "sparkpost-performance-test-campaign"  # Using performance test prefix
             }
         }
-        for i in range(1, 11)  # Generate 10 test emails
+        for i in range(1, 201)  # Generate 10 test emails
     ]
     
     # Send the emails
-    logger.info("Starting email sending test...")
+    logger.info("Starting email sending test with sink server...")
     results = sender.send_emails(test_emails, batch_size=5)
     
     # Print results
@@ -55,6 +54,8 @@ def main():
     logger.info(f"Successfully sent: {results['successfully_sent']}")
     logger.info(f"Failed: {results['failed']}")
     logger.info(f"Rate: {results['emails_per_second']:.2f} emails/second")
+    logger.info(f"Latency (ms): min={results['min_latency_ms']:.2f}, avg={results['avg_latency_ms']:.2f}, max={results['max_latency_ms']:.2f}")
+    logger.info(f"Implied latency (ms): {results['implied_latency_ms']:.2f} (total time / messages)")
     
     if results['failed'] > 0:
         logger.warning("Failed emails:")

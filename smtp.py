@@ -46,32 +46,41 @@ class SparkPostSMTPSender:
 
     def create_smtp_connection(self) -> smtplib.SMTP:
         """Create and return an authenticated SMTP connection with pipelining enabled."""
-        # Create SMTP connection
-        smtp = smtplib.SMTP(self.host, self.port)
+        # Create SMTP connection with timeout
+        smtp = smtplib.SMTP(self.host, self.port, timeout=30)  # 30 second timeout
         
         # Enable debug if needed
         # smtp.set_debuglevel(1)
         
-        # Identify ourselves to the SMTP server
-        smtp.ehlo_or_helo_if_needed()
-        
-        # Check if pipelining is supported
-        has_pipelining = smtp.has_extn('pipelining')
-        if has_pipelining:
-            logger.info("SMTP server supports pipelining")
-        else:
-            logger.warning("SMTP server does not support pipelining")
+        try:
+            # Identify ourselves to the SMTP server
+            smtp.ehlo_or_helo_if_needed()
             
-        # Start TLS if requested
-        if self.use_tls:
-            context = ssl.create_default_context()
-            smtp.starttls(context=context)
-            smtp.ehlo()  # Need to re-identify after TLS
+            # Check if pipelining is supported
+            has_pipelining = smtp.has_extn('pipelining')
+            if has_pipelining:
+                logger.debug("SMTP server supports pipelining")
+            else:
+                logger.warning("SMTP server does not support pipelining")
+                
+            # Start TLS if requested
+            if self.use_tls:
+                logger.debug("SMTP using TLS")
+                context = ssl.create_default_context()
+                smtp.starttls(context=context)
+                smtp.ehlo()  # Need to re-identify after TLS
+                
+            # Authenticate with SparkPost SMTP credentials
+            smtp.login('SMTP_Injection', self.api_key)
             
-        # Authenticate with SparkPost SMTP credentials
-        smtp.login('SMTP_Injection', self.api_key)
-        
-        return smtp
+            return smtp
+        except Exception as e:
+            # Ensure connection is closed if there's an error
+            try:
+                smtp.quit()
+            except:
+                pass
+            raise e
         
     def create_message(self, to_email: str, subject: str, text_content: str, 
                       html_content: Optional[str] = None, 
@@ -98,6 +107,8 @@ class SparkPostSMTPSender:
         """Send a batch of messages through a single SMTP connection."""
         sent_count = 0
         failed_messages = []
+        message_latencies = []  # Track latency for each message
+        smtp = None
         
         try:
             # Create a new connection for this batch
@@ -114,15 +125,21 @@ class SparkPostSMTPSender:
                         custom_headers=email_data.get('custom_headers')
                     )
                     
+                    # Track start time for this message
+                    start_time = time.time()
+                    
                     # Send the message
                     smtp.send_message(msg)
+                    
+                    # Calculate latency in milliseconds
+                    latency = (time.time() - start_time) * 1000
+                    message_latencies.append(latency)
                     sent_count += 1
                     
                     # Refresh connection after messages_per_connection
                     if (i + 1) % self.messages_per_connection == 0 and i + 1 < len(batch):
                         smtp.quit()
                         smtp = self.create_smtp_connection()
-                        logger.info(f"Refreshed SMTP connection after {self.messages_per_connection} messages")
                         
                 except Exception as e:
                     logger.error(f"Failed to send message to {email_data['to_email']}: {str(e)}")
@@ -130,10 +147,14 @@ class SparkPostSMTPSender:
                         'email_data': email_data,
                         'error': str(e)
                     })
+                    # If we have a connection error, try to create a new connection
+                    if smtp is not None:
+                        try:
+                            smtp.quit()
+                        except:
+                            pass
+                        smtp = self.create_smtp_connection()
                     
-            # Clean up connection
-            smtp.quit()
-            
         except Exception as e:
             logger.error(f"Batch sending error: {str(e)}")
             # Mark all remaining messages in batch as failed
@@ -142,39 +163,52 @@ class SparkPostSMTPSender:
                     'email_data': email_data,
                     'error': f"Batch error: {str(e)}"
                 })
+        finally:
+            # Ensure connection is always closed
+            if smtp is not None:
+                try:
+                    smtp.quit()
+                except:
+                    pass
                 
-        return sent_count, failed_messages
+        return sent_count, failed_messages, message_latencies
         
     def send_emails(self, emails: List[Dict[str, Any]], batch_size: int = 50) -> Dict[str, Any]:
-        """Send emails using multiple concurrent connections for optimal throughput.
-        
-        Args:
-            emails: List of email data dictionaries with keys:
-                   to_email, subject, text_content, html_content (optional), custom_headers (optional)
-            batch_size: Number of emails to process in each batch
-            
-        Returns:
-            Dictionary with results summary
-        """
+        """Send emails using multiple concurrent connections for optimal throughput."""
         start_time = time.time()
         total_sent = 0
         all_failed = []
+        all_latencies = []  # Collect latencies from all batches
         
         # Split emails into batches
         batches = [emails[i:i + batch_size] for i in range(0, len(emails), batch_size)]
-        logger.info(f"Sending {len(emails)} emails in {len(batches)} batches using {min(self.max_connections, len(batches))} concurrent connections")
+        num_connections = min(self.max_connections, len(batches))
+        logger.info(f"Sending {len(emails)} emails in {len(batches)} batches using up to {num_connections} concurrent connections")
         
         # Use a thread pool to send batches concurrently
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_connections) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_connections) as executor:
             futures = [executor.submit(self.send_batch, batch) for batch in batches]
             
             for future in concurrent.futures.as_completed(futures):
-                sent, failed = future.result()
+                sent, failed, latencies = future.result()
                 total_sent += sent
                 all_failed.extend(failed)
+                all_latencies.extend(latencies)
                 
         elapsed_time = time.time() - start_time
         rate = total_sent / elapsed_time if elapsed_time > 0 else 0
+        
+        # Calculate average latency in milliseconds
+        avg_latency = sum(all_latencies) / len(all_latencies) if all_latencies else 0
+        
+        # Calculate implied latency (total time / number of messages)
+        implied_latency = (elapsed_time * 1000) / total_sent if total_sent > 0 else 0
+        
+        # Log detailed latency statistics
+        if all_latencies:
+            min_latency = min(all_latencies)
+            max_latency = max(all_latencies)
+            logger.info(f"Latency statistics (ms): min={min_latency:.2f}, avg={avg_latency:.2f}, max={max_latency:.2f}, implied={implied_latency:.2f}")
         
         results = {
             'total_emails': len(emails),
@@ -182,10 +216,14 @@ class SparkPostSMTPSender:
             'failed': len(all_failed),
             'elapsed_seconds': elapsed_time,
             'emails_per_second': rate,
+            'avg_latency_ms': avg_latency,
+            'min_latency_ms': min(all_latencies) if all_latencies else 0,
+            'max_latency_ms': max(all_latencies) if all_latencies else 0,
+            'implied_latency_ms': implied_latency,
             'failed_details': all_failed
         }
         
-        logger.info(f"Email sending complete: {total_sent}/{len(emails)} sent successfully ({rate:.2f} emails/sec)")
+        logger.info(f"Email sending complete: {total_sent}/{len(emails)} sent successfully ({rate:.2f} emails/sec, avg latency: {avg_latency:.2f}ms, implied latency: {implied_latency:.2f}ms)")
         
         return results
 
